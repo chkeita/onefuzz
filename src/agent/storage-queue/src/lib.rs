@@ -6,6 +6,7 @@ use reqwest::Url;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
+use async_trait::async_trait;
 
 pub const EMPTY_QUEUE_DELAY: Duration = Duration::from_secs(10);
 pub mod azure_queue;
@@ -14,68 +15,82 @@ pub mod local_queue;
 use azure_queue::{AzureQueueClient, AzureQueueMessage};
 use local_queue::{ChannelQueueClient, FileQueueClient, LocalQueueMessage};
 
+#[async_trait]
+pub trait QueueClient<T:Serialize+Send+Sync+'static> {
+    //pub fn new(queue_url: Url) -> Result<Self>,
+    fn get_url(&self) -> Result<Url>;
+    async fn enqueue(&self, data: T) -> Result<()>;
+    async fn pop(&self) -> Result<Option<Message>>;
+}
+
 #[derive(Debug, Clone)]
-pub enum QueueClient {
+pub enum QueueClientImpl {
     AzureQueue(AzureQueueClient),
     FileQueueClient(Box<FileQueueClient>),
     Channel(ChannelQueueClient),
 }
 
-impl<'de> Deserialize<'de> for QueueClient {
+impl<'de> Deserialize<'de> for QueueClientImpl {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         Url::deserialize(deserializer)
-            .map(QueueClient::new)?
+            .map(QueueClientImpl::new)?
             .map_err(serde::de::Error::custom)
     }
 }
 
-impl QueueClient {
+
+impl QueueClientImpl {
     pub fn new(queue_url: Url) -> Result<Self> {
         if queue_url.scheme().to_lowercase() == "file" {
             let path = queue_url
                 .to_file_path()
                 .map_err(|_| anyhow!("invalid local path"))?;
             let local_queue = FileQueueClient::new(path)?;
-            Ok(QueueClient::FileQueueClient(Box::new(local_queue)))
+            Ok(QueueClientImpl::FileQueueClient(Box::new(local_queue)))
         } else {
-            Ok(QueueClient::AzureQueue(AzureQueueClient::new(queue_url)))
+            Ok(QueueClientImpl::AzureQueue(AzureQueueClient::new(queue_url)))
         }
     }
+}
 
-    pub fn get_url(self) -> Result<Url> {
+#[async_trait]
+impl <T:Serialize+Send+Sync+'static> QueueClient<T> for QueueClientImpl {
+
+    fn get_url(&self) -> Result<Url> {
         match self {
-            QueueClient::AzureQueue(queue_client) => Ok(queue_client.messages_url),
-            QueueClient::FileQueueClient(queue_client) => {
+            QueueClientImpl::AzureQueue(queue_client) => Ok(queue_client.messages_url.clone()),
+            QueueClientImpl::FileQueueClient(queue_client) => {
                 Url::from_file_path(queue_client.as_ref().path.clone())
                     .map_err(|_| anyhow!("invalid queue url"))
             }
-            QueueClient::Channel(queue_client) => Ok(queue_client.url),
+            QueueClientImpl::Channel(queue_client) => Ok(queue_client.url.clone()),
         }
     }
 
-    pub async fn enqueue(&self, data: impl Serialize) -> Result<()> {
+
+    async fn enqueue(&self, data: T) -> Result<()> {
         match self {
-            QueueClient::AzureQueue(queue_client) => queue_client.enqueue(data).await,
-            QueueClient::FileQueueClient(queue_client) => queue_client.enqueue(data).await,
-            QueueClient::Channel(queue_client) => queue_client.enqueue(data).await,
+            QueueClientImpl::AzureQueue(queue_client) => queue_client.enqueue(data).await,
+            QueueClientImpl::FileQueueClient(queue_client) => queue_client.enqueue(data).await,
+            QueueClientImpl::Channel(queue_client) => queue_client.enqueue(data).await,
         }
         .context("QueueClient.enqueue")
     }
 
-    pub async fn pop(&self) -> Result<Option<Message>> {
+    async fn pop(&self) -> Result<Option<Message>> {
         match self {
-            QueueClient::AzureQueue(queue_client) => {
+            QueueClientImpl::AzureQueue(queue_client) => {
                 let message = queue_client.pop().await.context("QueueClient.pop")?;
                 Ok(message.map(Message::QueueMessage))
             }
-            QueueClient::FileQueueClient(queue_client) => {
+            QueueClientImpl::FileQueueClient(queue_client) => {
                 let message = queue_client.pop().await.context("QueueClient.pop")?;
                 Ok(message.map(Message::LocalQueueMessage))
             }
-            QueueClient::Channel(queue_client) => {
+            QueueClientImpl::Channel(queue_client) => {
                 let message = queue_client.pop().await.context("QueueClient.pop")?;
                 Ok(message.map(Message::LocalQueueMessage))
             }

@@ -10,40 +10,47 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use storage_queue::QueueClient;
+use storage_queue::{QueueClient, QueueClientImpl};
 use tokio::{sync::Notify, task, task::JoinHandle};
+use serde::Serialize;
 
 const DEFAULT_HEARTBEAT_PERIOD: Duration = Duration::from_secs(60 * 5);
 
-pub struct HeartbeatContext<TContext, T> {
+pub struct HeartbeatContext<TContext, T, TMessage> {
     pub state: TContext,
-    pub queue_client: QueueClient,
+    pub queue_client: Box<dyn QueueClient<TMessage>>,
     pub pending_messages: Mutex<HashSet<T>>,
     pub cancelled: Notify,
 }
 
-pub struct HeartbeatClient<TContext, T>
+pub struct HeartbeatClient<TContext, T, TMessage>
 where
+    TContext: Send+Sync,
     T: Clone + Send + Sync,
+    TMessage: Send + Sync + Serialize
 {
-    pub context: Arc<HeartbeatContext<TContext, T>>,
+    pub context: Arc<HeartbeatContext<TContext, T, TMessage>>,
     pub heartbeat_process: JoinHandle<Result<()>>,
 }
 
-impl<TContext, T> Drop for HeartbeatClient<TContext, T>
+impl<TContext, T, TMessage> Drop for HeartbeatClient<TContext, T, TMessage>
 where
+    TContext: Send+Sync,
     T: Clone + Sync + Send,
+    TMessage: Send + Sync + Serialize
 {
     fn drop(&mut self) {
         self.context.cancelled.notify_one();
     }
 }
 
-impl<TContext, T> HeartbeatClient<TContext, T>
+impl<TContext, T, TMessage> HeartbeatClient<TContext, T, TMessage>
 where
+    TContext: Send+Sync,
     T: Clone + Sync + Send,
+    TMessage: Send + Sync + Serialize
 {
-    pub fn drain_current_messages(context: Arc<HeartbeatContext<TContext, T>>) -> Vec<T> {
+    pub fn drain_current_messages(context: Arc<HeartbeatContext<TContext, T, TMessage>>) -> Vec<T> {
         let lock = context.pending_messages.lock();
         let mut messages = lock.unwrap();
         let drain = messages.iter().cloned().collect::<Vec<T>>();
@@ -51,33 +58,33 @@ where
         drain
     }
 
-    pub async fn start_background_process<Fut>(
-        queue_url: Url,
-        messages: Arc<Mutex<HashSet<T>>>,
-        cancelled: Arc<Notify>,
-        heartbeat_period: Duration,
-        flush: impl Fn(Arc<QueueClient>, Arc<Mutex<HashSet<T>>>) -> Fut,
-    ) -> Result<()>
-    where
-        Fut: Future<Output = ()> + Send,
-    {
-        let queue_client = Arc::new(QueueClient::new(queue_url)?);
-        flush(queue_client.clone(), messages.clone()).await;
-        while !cancelled.is_notified(heartbeat_period).await {
-            flush(queue_client.clone(), messages.clone()).await;
-        }
-        flush(queue_client.clone(), messages.clone()).await;
-        Ok(())
-    }
+    // pub async fn start_background_process<Fut>(
+    //     queue_url: Url,
+    //     messages: Arc<Mutex<HashSet<T>>>,
+    //     cancelled: Arc<Notify>,
+    //     heartbeat_period: Duration,
+    //     flush: impl Fn(Arc<dyn QueueClient>, Arc<Mutex<HashSet<T>>>) -> Fut,
+    // ) -> Result<()>
+    // where
+    //     Fut: Future<Output = ()> + Send,
+    // {
+    //     let queue_client = Arc::new(QueueClient::new(queue_url)?);
+    //     flush(queue_client.clone(), messages.clone()).await;
+    //     while !cancelled.is_notified(heartbeat_period).await {
+    //         flush(queue_client.clone(), messages.clone()).await;
+    //     }
+    //     flush(queue_client.clone(), messages.clone()).await;
+    //     Ok(())
+    // }
 
     pub fn init_heartbeat<F, Fut>(
         context: TContext,
         queue_url: Url,
         heartbeat_period: Option<Duration>,
         flush: F,
-    ) -> Result<HeartbeatClient<TContext, T>>
+    ) -> Result<HeartbeatClient<TContext, T, TMessage>>
     where
-        F: Fn(Arc<HeartbeatContext<TContext, T>>) -> Fut + Sync + Send + 'static,
+        F: Fn(Arc<HeartbeatContext<TContext, T, TMessage>>) -> Fut + Sync + Send + 'static,
         Fut: Future<Output = ()> + Send,
         T: 'static,
         TContext: Send + Sync + 'static,
@@ -86,7 +93,7 @@ where
 
         let context = Arc::new(HeartbeatContext {
             state: context,
-            queue_client: QueueClient::new(queue_url)?,
+            queue_client:Box::new( QueueClientImpl::new(queue_url)?),
             pending_messages: Mutex::new(HashSet::<T>::new()),
             cancelled: Notify::new(),
         });
